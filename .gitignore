@@ -1,0 +1,14 @@
+# Credenciales locales (WiFi, host del edge, token): usar Secrets.example.h como plantilla
+AliviaMicrophone/Secrets.h
+
+# Salida de compilacion de arduino-cli
+build/
+*.bin
+*.elf
+*.map
+
+# IDEs
+.idea/
+.vscode/
+cmake-build-*/
+.DS_Store
