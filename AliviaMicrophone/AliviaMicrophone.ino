@@ -1,39 +1,52 @@
 /**
  * Alivia Voice - ESP32 #1: microfono INMP441 (I2S) sobre el framework ModestIoT.
  *
- * Etapa actual: solo el microfono, sin conexion al edge. El objetivo es comprobar
- * que el audio llega limpio a PCM 16 kHz / 16 bit / mono, que es lo que consumira
- * el edge de voz por WebSocket (/audio-in) mas adelante.
+ * Microfono INMP441 + parlante MAX98357A conectados al edge de voz por WebSocket (ws://<host>:<puerto>/ws,
+ * contrato en docs/protocolo-websocket.md). Envia PCM 16 kHz / 16 bit / mono y reproduce el audio de respuesta.
  *
  * Arquitectura (ModestIoT):
- *   Inmp441Microphone (Sensor)  -> tarea de captura I2S propia, estadisticas y VAD
- *   MicrophoneDevice  (Device)  -> scheduler por timer y telemetria
+ *   Inmp441Microphone (Sensor)   -> tarea de captura I2S propia (core 1), estadisticas y VAD
+ *   MicrophoneDevice  (Device)   -> scheduler por timer y telemetria (Serial y WebSocket)
+ *   EdgeLink                     -> WiFi + WebSocket, hello, reconexion con backoff (core 0)
+ *   AudioStreamer                -> cola de frames del microfono -> WebSocket (core 0)
+ *   Max98357Speaker  (Actuator)  -> jitter buffer + reproduccion I2S (core 0)
  *
  * Requisitos:
  *   - Placa: ESP32 Dev Module (ESP32 clasico). Core "esp32" de Espressif 3.x.
- *   - Libreria: ArduinoJson 7.x (la capa de scheduler ModestIoT esta en esta carpeta).
+ *   - Librerias: ArduinoJson 7.x y WebSockets 2.7.x (Markus Sattler / Links2004). La capa de scheduler
+ *     ModestIoT esta en esta carpeta.
+ *   - Secrets.h: copia Secrets.example.h y rellena WiFi, host del edge y token (esta ignorado por git).
  *   - Monitor serie a 115200 baudios, fin de linea "Ninguno" o "Nueva linea".
  *
  * Comandos por el monitor serie (una letra + Enter):
  *   h  ayuda           s  estado            v  vumetro en vivo on/off
  *   +  ganancia +3 dB  -  ganancia -3 dB    j  JSON de telemetria on/off
+ *   w  estado del enlace   t  tono de prueba por el parlante
  *   r  prueba de 3 s analizada en el ESP32 (pico, nivel, recortes, veredicto)
  *   R  graba 3 s y envia un WAV binario (usar tools/grabar_wav.py, no el monitor)
  */
 
 #include "Device.h"
+#include <WiFi.h>
 #include <esp_heap_caps.h>
 
-#include "MicrophoneConfig.h"
+#include "AudioStreamer.h"
+#include "EdgeLink.h"
 #include "Inmp441Microphone.h"
+#include "Max98357Speaker.h"
+#include "MicrophoneConfig.h"
 #include "MicrophoneDevice.h"
 #include "SerialConsole.h"
+#include "Secrets.h"
 
 // ---------------------------------------------------------------------------
 // Objetos del framework (el I2S se inicia en setup(), no en los constructores)
 // ---------------------------------------------------------------------------
 Inmp441Microphone microphone(MICROPHONE_SCK_PIN, MICROPHONE_WS_PIN, MICROPHONE_SD_PIN, AUDIO_SAMPLE_RATE);
 MicrophoneDevice microphoneDevice(DEVICE_ID, microphone, SCHEDULER_TICK_MS);
+EdgeLink edgeLink(WIFI_SSID, WIFI_PASSWORD, EDGE_HOST, EDGE_PORT, EDGE_PATH, DEVICE_ID, EDGE_TOKEN);
+Max98357Speaker speaker(SPEAKER_BCLK_PIN, SPEAKER_LRC_PIN, SPEAKER_DIN_PIN, PLAYBACK_SAMPLE_RATE, edgeLink);
+AudioStreamer audioStreamer(microphone, edgeLink);
 
 bool liveMeterEnabled = false;
 bool microphoneReady = false;
@@ -179,6 +192,7 @@ void printHelp() {
         "  h  ayuda                 s  estado\n"
         "  v  vumetro en vivo       j  JSON de telemetria\n"
         "  +  ganancia +3 dB        -  ganancia -3 dB\n"
+        "  w  estado del enlace     t  tono de prueba (parlante)\n"
         "  r  prueba de %lu s (habla durante la prueba)\n"
         "  R  enviar WAV al PC (solo con tools/grabar_wav.py)\n\n",
         static_cast<unsigned long>(TEST_RECORDING_SECONDS));
@@ -197,6 +211,29 @@ void printStatus() {
         static_cast<unsigned>(ESP.getFreeHeap()),
         static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
         static_cast<unsigned>(ESP.getFreePsram()));
+}
+
+void printLinkStatus() {
+    const LinkStats link = edgeLink.stats();
+    const SpeakerStats sound = speaker.stats();
+    SerialConsole::printf(
+        "[Enlace] estado %s | WiFi %s, IP %s, RSSI %d dBm | edge ws://%s:%u%s\n"
+        "[Enlace] enviado %lu B, recibido %lu B | reconexiones %lu, intentos fallidos %lu\n"
+        "[Enlace] mic: %lu mensajes de audio enviados | descartados sin enlace %lu, fallos de envio %lu, cola del mic %lu\n"
+        "[Parlante] volumen %u%% | buffer %lu/%lu B | %s | enunciados %lu, underruns %lu, desbordado %lu B, cancelados %lu\n"
+        "[Heap] libre %u B, bloque mayor %u B, minimo historico %u B\n",
+        EdgeLink::describeState(edgeLink.state()), WiFi.status() == WL_CONNECTED ? "OK" : "sin conexion",
+        WiFi.localIP().toString().c_str(), WiFi.RSSI(), edgeLink.host(), edgeLink.port(), EDGE_PATH,
+        static_cast<unsigned long>(link.bytesSent), static_cast<unsigned long>(link.bytesReceived),
+        static_cast<unsigned long>(link.reconnects), static_cast<unsigned long>(link.handshakeFailures),
+        static_cast<unsigned long>(link.micFramesSent), static_cast<unsigned long>(link.micFramesDroppedNoLink),
+        static_cast<unsigned long>(link.micFramesDroppedSendFail), static_cast<unsigned long>(link.micQueueDrops),
+        static_cast<unsigned>(speaker.getVolumePercent()), static_cast<unsigned long>(sound.bufferedBytes),
+        static_cast<unsigned long>(sound.bufferCapacityBytes), sound.playing ? "sonando" : "en silencio",
+        static_cast<unsigned long>(sound.utterances), static_cast<unsigned long>(sound.underruns),
+        static_cast<unsigned long>(sound.overflowBytes), static_cast<unsigned long>(sound.cancelled),
+        static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+        static_cast<unsigned>(ESP.getMinFreeHeap()));
 }
 
 void changeGain(float deltaInDecibels) {
@@ -219,6 +256,11 @@ void handleSerialCommand(char command) {
             break;
         case '+': changeGain(3.0f); break;
         case '-': changeGain(-3.0f); break;
+        case 'w': printLinkStatus(); break;
+        case 't':
+            SerialConsole::printf("[Parlante] Tono de prueba: debes oirlo por el parlante.\n");
+            speaker.handle(Max98357Speaker::PLAY_TEST_TONE_COMMAND);
+            break;
         case 'r': runTestRecording(); break;
         case 'R': sendWavRecording(); break;
         case '\r': case '\n': case ' ': break;
@@ -247,6 +289,9 @@ void setup() {
     microphone.setVoiceHangoverInMilliseconds(VOICE_HANGOVER_MS);
     microphone.setReportIntervalInMilliseconds(LEVEL_REPORT_INTERVAL_MS);
 
+    // The frame queue must exist before the capture task starts (AudioStreamer drains it).
+    microphone.enableFrameQueue(MIC_QUEUE_FRAMES);
+
     if (!microphone.begin(MICROPHONE_CHANNEL)) {
         SerialConsole::printf("[Boot] ERROR: no se pudo iniciar I2S. Revisa los pines y que el core ESP32 sea 3.x.\n");
         return;
@@ -254,9 +299,23 @@ void setup() {
     microphoneReady = true;
     microphoneDevice.begin();
 
+    // Speaker and link: if any fails the microphone keeps working over Serial as before.
+    microphoneDevice.attachLink(&edgeLink);
+    edgeLink.setListener(&speaker);
+    if (!speaker.begin()) {
+        SerialConsole::printf("[Boot] ERROR: no se pudo iniciar el parlante (BCLK=%d LRC=%d DIN=%d).\n",
+                              SPEAKER_BCLK_PIN, SPEAKER_LRC_PIN, SPEAKER_DIN_PIN);
+    }
+    if (!edgeLink.begin() || !audioStreamer.begin()) {
+        SerialConsole::printf("[Boot] ERROR: no se pudo iniciar el enlace con el edge.\n");
+    }
+
     SerialConsole::printf("[Boot] Microfono listo: %lu Hz, 16 bit, mono. SCK=%d WS=%d SD=%d, ganancia %.0f dB\n",
                           static_cast<unsigned long>(AUDIO_SAMPLE_RATE), MICROPHONE_SCK_PIN, MICROPHONE_WS_PIN,
                           MICROPHONE_SD_PIN, microphone.getGainInDecibels());
+    SerialConsole::printf("[Boot] Parlante: BCLK=%d LRC=%d DIN=%d, %lu Hz, volumen %u%%. Enlace: %s -> ws://%s:%u%s\n",
+                          SPEAKER_BCLK_PIN, SPEAKER_LRC_PIN, SPEAKER_DIN_PIN, static_cast<unsigned long>(PLAYBACK_SAMPLE_RATE),
+                          static_cast<unsigned>(SPEAKER_VOLUME_PERCENT), WIFI_SSID, EDGE_HOST, EDGE_PORT, EDGE_PATH);
     printHelp();
 }
 

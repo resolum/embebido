@@ -1,6 +1,7 @@
 #include "MicrophoneDevice.h"
 
 #include "AudioTelemetry.h"
+#include "MicrophoneConfig.h"
 #include "SerialConsole.h"
 
 namespace {
@@ -88,7 +89,21 @@ void MicrophoneDevice::processQueuedTelemetryData(const TelemetryPackage* teleme
         serializeJson(document, json);
         SerialConsole::printf("%s\n", json.c_str());
     }
+
+    if (link != nullptr) {
+        const bool isLevel = strcmp(type, "audio_level") == 0;
+        if (isLevel) {
+            link->addMicQueueDrops(static_cast<const AudioLevelTelemetry*>(telemetryPackage)->report.droppedFrames);
+        }
+        if (link->isReady() && (!isLevel || SEND_AUDIO_LEVEL_TELEMETRY)) {
+            String json;
+            serializeJson(document, json);
+            link->sendText(json.c_str());
+        }
+    }
 }
+
+void MicrophoneDevice::attachLink(EdgeLink* edgeLink) { link = edgeLink; }
 
 void MicrophoneDevice::setJsonOutputEnabled(bool enabled) { jsonOutputEnabled = enabled; }
 
