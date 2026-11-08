@@ -9,7 +9,7 @@
  * goes to the edge from MicrophoneDevice::processQueuedTelemetryData().
  */
 
-#include <TelemetryPackage.h>
+#include "TelemetryPackage.h"
 #include "Inmp441Microphone.h"
 
 /** @brief Periodic level report (one per report interval). */

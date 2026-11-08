@@ -11,8 +11,7 @@
  *
  * Requisitos:
  *   - Placa: ESP32 Dev Module (ESP32 clasico). Core "esp32" de Espressif 3.x.
- *   - Librerias: ModestIoT y sus dependencias (ArduinoJson, DHT sensor library,
- *     ESP32Servo, HX711, LiquidCrystal I2C, PubSubClient).
+ *   - Libreria: ArduinoJson 7.x (la capa de scheduler ModestIoT esta en esta carpeta).
  *   - Monitor serie a 115200 baudios, fin de linea "Ninguno" o "Nueva linea".
  *
  * Comandos por el monitor serie (una letra + Enter):
@@ -22,7 +21,7 @@
  *   R  graba 3 s y envia un WAV binario (usar tools/grabar_wav.py, no el monitor)
  */
 
-#include <ModestIoT.h>
+#include "Device.h"
 #include <esp_heap_caps.h>
 
 #include "MicrophoneConfig.h"

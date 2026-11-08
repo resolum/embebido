@@ -15,7 +15,7 @@
  * Inmp441Microphone handles it so the 16 kHz stream is never late.
  */
 
-#include <Device.h>
+#include "Device.h"
 #include "Inmp441Microphone.h"
 
 class MicrophoneDevice : public Device {
